@@ -3,6 +3,8 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
+const { execSync } = require("child_process");
+const zlib = require("zlib");
 
 const app = express();
 app.use(cors());
@@ -50,63 +52,194 @@ app.post("/finalize-upload", async (req, res) => {
     return res.status(404).json({ message: "Không tìm thấy folder chunk." });
   }
 
-  // Tránh trùng tên file
   let baseName = fileName;
-  let finalPath = path.join(FINAL_DIR, `${baseName}.glb.gz`);
+  let tempGzipPath = path.join(TEMP_DIR, `${fileId}_temp.glb`);
+  let rawGlbPath = path.join(TEMP_DIR, `${fileId}_raw.glb`);
+  let optimizedPath = path.join(FINAL_DIR, `${baseName}.glb`);
   let counter = 1;
 
-  while (fs.existsSync(finalPath)) {
+  // Tạo unique filename nếu file đã tồn tại
+  while (fs.existsSync(optimizedPath)) {
     baseName = `${fileName}_${counter}`;
-    finalPath = path.join(FINAL_DIR, `${baseName}.glb.gz`);
+    optimizedPath = path.join(FINAL_DIR, `${baseName}.glb`);
     counter++;
   }
 
-  // Ghép các chunk lại thành file cuối
-  const writeStream = fs.createWriteStream(finalPath);
-
-  for (let i = 0; i < totalChunks; i++) {
-    const chunkPath = path.join(chunkDir, `chunk_${i}`);
-    if (!fs.existsSync(chunkPath)) {
-      return res.status(400).json({ message: `Chunk ${i} bị thiếu.` });
+  try {
+    // Ghép chunks
+    const writeStream = fs.createWriteStream(tempGzipPath);
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkPath = path.join(chunkDir, `chunk_${i}`);
+      if (!fs.existsSync(chunkPath)) {
+        throw new Error(`Chunk ${i} bị thiếu.`);
+      }
+      const data = fs.readFileSync(chunkPath);
+      writeStream.write(data);
     }
-    const data = fs.readFileSync(chunkPath);
-    writeStream.write(data);
-  }
+    writeStream.end();
 
-  writeStream.end(() => {
-    // Dọn dẹp chunk tạm
+    // Đợi stream hoàn thành
+    await new Promise((resolve, reject) => {
+      writeStream.on("finish", resolve);
+      writeStream.on("error", reject);
+    });
+
+    // Decompress client gzip data
+    console.log("Decompressing client data...");
+    const compressedData = fs.readFileSync(tempGzipPath);
+    const decompressed = zlib.gunzipSync(compressedData);
+    fs.writeFileSync(rawGlbPath, decompressed);
+
+    // Optimize với gltf-pipeline
+    try {
+      execSync("gltf-pipeline --version", { stdio: "pipe" });
+      console.log("🔧 Optimizing with gltf-pipeline...");
+
+      const pipelineCmd = [
+        "gltf-pipeline",
+        `-i "${rawGlbPath}"`,
+        `-o "${optimizedPath}"`,
+        "--draco.compressionLevel 0", // Compression thấp nhất
+        "--draco.quantizePositionBits 16", // Precision cao nhất
+        "--draco.quantizeNormalBits 16", // Max precision cho normals
+        "--draco.quantizeTexcoordBits 16", // Max precision cho UVs
+        "--draco.unifiedQuantization false", // Tắt unified quantization
+        "--binary", // Đảm bảo GLB output
+      ].join(" ");
+
+      execSync(pipelineCmd, { stdio: "pipe" });
+
+      const originalSize = fs.statSync(rawGlbPath).size;
+      const optimizedSize = fs.statSync(optimizedPath).size;
+      const reduction = Math.round((1 - optimizedSize / originalSize) * 100);
+
+      console.log(
+        `✅ Draco optimization completed! Size reduced by ${reduction}%`
+      );
+      console.log(`   Original: ${(originalSize / 1024 / 1024).toFixed(2)}MB`);
+      console.log(
+        `   Optimized: ${(optimizedSize / 1024 / 1024).toFixed(2)}MB`
+      );
+    } catch (err) {
+      console.error("❌ Lỗi khi chạy gltf-pipeline:", err.message)
+      fs.copyFileSync(rawGlbPath, optimizedPath);
+    }
+
+    // Cleanup temp files
     fs.rmSync(chunkDir, { recursive: true, force: true });
-    res.status(200).json({ message: "File đã được ghép và lưu thành công." });
-  });
+    if (fs.existsSync(tempGzipPath)) fs.unlinkSync(tempGzipPath);
+    if (fs.existsSync(rawGlbPath)) fs.unlinkSync(rawGlbPath);
+
+    res.status(200).json({
+      message: "File uploaded và tối ưu thành công.",
+      filename: `${baseName}.glb`,
+    });
+  } catch (error) {
+    console.error("Lỗi khi xử lý file:", error);
+
+    try {
+      fs.rmSync(chunkDir, { recursive: true, force: true });
+      if (fs.existsSync(tempGzipPath)) fs.unlinkSync(tempGzipPath);
+      if (fs.existsSync(rawGlbPath)) fs.unlinkSync(rawGlbPath);
+      if (fs.existsSync(optimizedPath)) fs.unlinkSync(optimizedPath);
+    } catch (cleanupError) {
+      console.error("Cleanup error:", cleanupError);
+    }
+
+    res.status(500).json({
+      message: "Lỗi khi xử lý file.",
+      error: error.message,
+    });
+  }
 });
 
-// Xem danh sách file đã ghép
+// Xem danh sách file đã upload
 app.get("/models", (req, res) => {
-  const files = fs
-    .readdirSync(FINAL_DIR)
-    .filter((name) => name.endsWith(".glb.gz"));
-  res.json(files);
+  try {
+    const files = fs
+      .readdirSync(FINAL_DIR)
+      .filter((name) => name.endsWith(".glb"))
+      .map((filename) => {
+        const filePath = path.join(FINAL_DIR, filename);
+        const stats = fs.statSync(filePath);
+        return {
+          name: filename,
+          size: stats.size,
+          uploadDate: stats.mtime,
+        };
+      })
+      .sort((a, b) => b.uploadDate - a.uploadDate); // Sort by newest first
+
+    res.json(files);
+  } catch (error) {
+    console.error("Error reading models directory:", error);
+    res.status(500).json({ message: "Lỗi khi đọc danh sách models." });
+  }
 });
 
-// Loadfile cho người dùng
+// Serve model files
 app.get("/models/:fileName", (req, res) => {
   const fileName = req.params.fileName;
+
+  // Security: prevent path traversal
+  if (
+    fileName.includes("..") ||
+    fileName.includes("/") ||
+    fileName.includes("\\")
+  ) {
+    return res.status(400).send("Invalid filename.");
+  }
+
   const filePath = path.join(FINAL_DIR, fileName);
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).send("File không tồn tại.");
   }
 
-  // Nếu là file .gz thì báo cho trình duyệt biết để tự giải nén
-  if (fileName.endsWith(".gz")) {
-    res.setHeader("Content-Type", "model/gltf-binary");
-    res.setHeader("Content-Disposition", `inline; filename="${fileName.replace(/\.gz$/, '')}"`);
-  }
+  // Set appropriate headers for GLB files
+  res.setHeader("Content-Type", "model/gltf-binary");
+  res.setHeader("Cache-Control", "public, max-age=31536000"); // Cache 1 year
+  res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+
+  // Enable CORS for model loading
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   res.sendFile(filePath);
 });
 
+// Delete model endpoint
+app.delete("/models/:fileName", (req, res) => {
+  const fileName = req.params.fileName;
+
+  // Security check
+  if (
+    fileName.includes("..") ||
+    fileName.includes("/") ||
+    fileName.includes("\\")
+  ) {
+    return res.status(400).json({ message: "Invalid filename." });
+  }
+
+  const filePath = path.join(FINAL_DIR, fileName);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ message: "File không tồn tại." });
+  }
+
+  try {
+    fs.unlinkSync(filePath);
+    res.json({ message: `File ${fileName} đã được xóa.` });
+  } catch (error) {
+    console.error("Error deleting file:", error);
+    res.status(500).json({ message: "Lỗi khi xóa file." });
+  }
+});
 
 // Start server
-const PORT = 3000;
-app.listen(PORT, () => console.log(`Server chạy ở http://localhost:${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`📁 Models directory: ${FINAL_DIR}`);
+});

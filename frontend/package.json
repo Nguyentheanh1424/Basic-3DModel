@@ -12,6 +12,7 @@
     "vite": "^7.0.4"
   },
   "dependencies": {
+    "meshoptimizer": "^0.24.0",
     "pako": "^2.1.0",
     "three": "^0.178.0"
   }
